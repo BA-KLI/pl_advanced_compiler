@@ -10,6 +10,158 @@
 #include "parser/gramparse.h"
 #include "parser/parser.h"
 #include "nodes/pg_list.h"
+#include "catalog/pg_type.h"
+#include "pl_graphs/pl_graphs.h"
+
+
+PLpgSQL_row *
+build_row_from_vars(PLpgSQL_variable **vars, int numvars);
+PLpgSQL_variable** varnumbersToVariables(int* varnos, int nfields,PLpgSQL_function* surroundingFunc);
+PLpgSQL_variable* varnumberToVariable(int varno,PLpgSQL_function* surroundingFunc);
+Bitmapset* getParametersOfQueryExpr(PLpgSQL_expr*         expr,
+                                    PLpgSQL_function*     surroundingFunction,
+                                    PLpgSQL_execstate*     estate);
+char* valToStringEscape(Value* val, bool escape);
+char* valToString(Value* val);
+void replaceStmt(PLpgSQL_stmt* oldStmt, PLpgSQL_stmt* newStmt, List* parents);
+char* concatMultipleValues(List* values1, List* values2, char* infix, char* suffix, char* prefix1, char* prefix2);
+
+char* concatValuesWithPrefix(List* values, char* seperator, char* prefix);
+char* concatValues(List* values, char* seperator);
+char* resTargetToString(ResTarget* target);
+
+List* resolveQueryRefsSkipN(char* query, int n);
+List* resolveQueryRefs(char* query);
+Value* resolveTargetRefStrToCorrespVarno(int varno, int* vars, int nvars,char* query);
+List* resolveBmsRefs(Bitmapset* bms_in, PLpgSQL_execstate *estate, PLpgSQL_function *func);
+Value* makeStringWithAlias(char* string, int aliasId);
+List* resolveQueryColumns(Bitmapset* bms_in, int* vars, int nvars, char* query, PLpgSQL_execstate *estate, PLpgSQL_function *func, bool aliases);
+char* qb(char* queryToBatch, char* parameterQuery);
+char* project(char* baseQuery, char* newSelects, char* subQueryAlias);
+char* leftOuterJoin(char* baseQuery, char* secondQuery, List* params, char* aliasLeft, char* aliasRight);
+
+PLpgSQL_stmt_fors* createFors(char* query, int* varnos, int nfields ,List* body,PLpgSQL_stmt_fors* oldFors, PLpgSQL_function *func);
+
+void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estate, PLpgSQL_function *func);
+
+/**
+ * Workaround to get the parameters of a query as Bitmapset
+ */
+Bitmapset* getParametersOfQueryExpr(PLpgSQL_expr*         expr,
+                                    PLpgSQL_function*     surroundingFunction,
+                                    PLpgSQL_execstate*     estate){
+
+    expr->func = surroundingFunction;
+
+    expr->func->cur_estate = palloc(sizeof(PLpgSQL_execstate));
+    expr->func->cur_estate->ndatums = expr->func->ndatums;
+        expr->func->cur_estate->datums = surroundingFunction->datums;
+
+    SPI_prepare_params(expr->query,
+                              (ParserSetupHook) plpgsql_parser_setup,
+                              (void *) expr,
+                              0);
+
+
+    return expr->paramnos;
+}
+
+
+
+/*
+ * Build a row-variable data structure given the component variables.
+ */
+PLpgSQL_row *
+build_row_from_vars(PLpgSQL_variable **vars, int numvars)
+{
+    PLpgSQL_row *row;
+    int         i;
+
+    row = palloc0(sizeof(PLpgSQL_row));
+    row->dtype = PLPGSQL_DTYPE_ROW;
+    row->rowtupdesc = CreateTemplateTupleDesc(numvars, false);
+    row->nfields = numvars;
+    row->fieldnames = palloc(numvars * sizeof(char *));
+    row->varnos = palloc(numvars * sizeof(int));
+
+    for (i = 0; i < numvars; i++)
+    {
+        PLpgSQL_variable *var = vars[i];
+        Oid         typoid = RECORDOID;
+        int32       typmod = -1;
+        Oid         typcoll = InvalidOid;
+
+        switch (var->dtype)
+        {
+            case PLPGSQL_DTYPE_VAR:
+                typoid = ((PLpgSQL_var *) var)->datatype->typoid;
+                typmod = ((PLpgSQL_var *) var)->datatype->atttypmod;
+                typcoll = ((PLpgSQL_var *) var)->datatype->collation;
+                break;
+
+            case PLPGSQL_DTYPE_REC:
+                break;
+
+            case PLPGSQL_DTYPE_ROW:
+                if (((PLpgSQL_row *) var)->rowtupdesc)
+                {
+                    typoid = ((PLpgSQL_row *) var)->rowtupdesc->tdtypeid;
+                    typmod = ((PLpgSQL_row *) var)->rowtupdesc->tdtypmod;
+                    /* composite types have no collation */
+                }
+                break;
+
+            default:
+                elog(ERROR, "unrecognized dtype: %d", var->dtype);
+        }
+
+        row->fieldnames[i] = var->refname;
+        row->varnos[i] = var->dno;
+
+        TupleDescInitEntry(row->rowtupdesc, i + 1,
+                           var->refname,
+                           typoid, typmod,
+                           0);
+        TupleDescInitEntryCollation(row->rowtupdesc, i + 1, typcoll);
+    }
+    return row;
+}
+
+
+
+PLpgSQL_variable** varnumbersToVariables(int* varnos, int nfields,PLpgSQL_function* surroundingFunc){
+    PLpgSQL_variable** vars = palloc0(nfields*sizeof(PLpgSQL_variable*));
+
+    for(int i=0;i<nfields;i++){
+        vars[i] = varnumberToVariable(varnos[i],surroundingFunc);
+    }
+
+    return vars;
+}
+
+
+PLpgSQL_variable* varnumberToVariable(int varno,PLpgSQL_function* surroundingFunc){
+
+    /* iterate over the datums */
+    for(int i=0; i<surroundingFunc->ndatums;i++){
+        PLpgSQL_datum* datum = surroundingFunc->datums[i];
+        /* check if datum type is a variable */
+        if (datum->dtype == PLPGSQL_DTYPE_VAR) {
+            PLpgSQL_variable* myvar = ((PLpgSQL_variable*)datum);
+            /* check if it has the given variable number */
+            if(myvar->dno == varno){
+                /* the variable */
+                return myvar;
+            }
+        }
+        else{
+            printf("No valid variable\n");
+        }
+    }
+    printf("Error variable not found");
+    return (PLpgSQL_variable*)NULL;
+}
+
 
 
 void replaceStmt(PLpgSQL_stmt* oldStmt, PLpgSQL_stmt* newStmt, List* parents){
@@ -45,7 +197,7 @@ char* valToStringEscape(Value* val, bool escape){
             sprintf(value,"%li",intVal(val));
             break;
         default:
-            elog(ERROR,"Unkown node type:%s\n", nodeToString(val->type));
+            elog(ERROR,"Unkown node type:%s\n", nodeToString(val));
             break;
     }
     return value;
@@ -113,19 +265,19 @@ char* resTargetToString(ResTarget* target){
     else{
 
         if(IsA(target->val,ColumnRef)){
-            ColumnRef* ref = target->val;
+            ColumnRef* ref = (ColumnRef*)target->val;
             char* cri_name = valToString(lfirst(ref->fields->head));
 
             sprintf(eos(vars),"%s",cri_name);
         }
         else if(IsA(target->val,A_Const)){
-            A_Const* c = target->val;
+            A_Const* c = (A_Const*)target->val;
             sprintf(eos(vars),"%s",valToStringEscape(&c->val,1));
 
         }
         else if(IsA(target->val,FuncCall)){
             //VERY DIRTY -> FIX
-            FuncCall* c = target->val;
+            FuncCall* c = (FuncCall*)target->val;
 
             ColumnRef* colref = lfirst(c->args->head);
             sprintf(eos(vars),"%s(%s) as __%s%i",valToString(lfirst(c->funcname->head)),concatValues(colref->fields,"."),valToString(lfirst(c->funcname->head)),c->location);
@@ -283,6 +435,7 @@ char* leftOuterJoin(char* baseQuery, char* secondQuery, List* params, char* alia
     return query;
 }
 
+
 PLpgSQL_stmt_fors* createFors(char* query, int* varnos, int nfields ,List* body,PLpgSQL_stmt_fors* oldFors, PLpgSQL_function *func){
 
     PLpgSQL_stmt_fors* newFors = palloc(sizeof(PLpgSQL_stmt_fors));
@@ -293,19 +446,11 @@ PLpgSQL_stmt_fors* createFors(char* query, int* varnos, int nfields ,List* body,
     newFors->query->func = func;
     newFors->query->ns = oldFors->query->ns;
     newFors->rec = NULL;
-    newFors->row = oldFors->row;
-        //newFors->row->dno = oldFors->row->dno;
-        //newFors->row->dtype = PLPGSQL_DTYPE_ROW;
+    PLpgSQL_variable** vars = varnumbersToVariables(varnos,nfields,func);
 
-        newFors->row->varnos = varnos;
-        newFors->row->nfields = nfields;
+    newFors->row = build_row_from_vars(vars, nfields);
+    plpgsql_adddatum((PLpgSQL_datum*)newFors->row);
 
-        /*
-        newFors->row->rowtupdesc = oldFors->row->rowtupdesc;
-        newFors->row->fieldnames = oldFors->row->fieldnames;
-        newFors->row->refname = oldFors->row->refname;
-        newFors->row->lineno = oldFors->row->lineno;
-        newFors->row->refname = oldFors->row->refname;*/
     newFors->body = body;
     return newFors;
 }
@@ -314,7 +459,7 @@ PLpgSQL_stmt_fors* createFors(char* query, int* varnos, int nfields ,List* body,
 void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estate, PLpgSQL_function *func){
     PLpgSQL_stmt* firstStmt = lfirst(fors->body->head);
     if(firstStmt && firstStmt->cmd_type == PLPGSQL_STMT_EXECSQL){
-        PLpgSQL_stmt_execsql* execsql = firstStmt;
+        PLpgSQL_stmt_execsql* execsql = (PLpgSQL_stmt_execsql*)firstStmt;
         if(execsql->row && execsql->into){
 
                 PLpgSQL_expr* q = execsql->sqlstmt;
@@ -341,10 +486,10 @@ void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estat
                                                             func,
                                                             1);
 
-                sprintf(qbquery,project(  qO->query,
-                                          concatValues( c_new,
-                                                        ","),
-                                          "_sub"));
+                sprintf(qbquery,"%s",project(  qO->query,
+                                              concatValues( c_new,
+                                                            ","),
+                                              "_sub"));
 
                 c_new = resolveQueryColumns(          c_,
                                                                             fors->row->varnos,
@@ -360,7 +505,7 @@ void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estat
                  * When executing, the result will be table with m + k columns where for every row the last k columns correspond
                  * to the result of executing query q using the first m columns as input parameters.
                  */
-                sprintf(qbquery,qb(q->query,qbquery));
+                sprintf(qbquery,"%s",qb(q->query,qbquery));
 
 
                 /**
@@ -396,11 +541,11 @@ void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estat
                  * bind columns c1,...,cn,c′′1,...,c′′k to the variables
                  * v1,...,vn,v′′1,...,v′′k
                  */
-                for(int i=0;i<fors->row && i < fors->row->nfields;i++){
+                for(int i=0;fors->row && i < fors->row->nfields;i++){
                     int vi = fors->row->varnos[i];
                     varnosFor[i] = vi;
                 }
-                for(int i=0;i<execsql->row && i < execsql->row->nfields;i++){
+                for(int i=0;execsql->row && i < execsql->row->nfields;i++){
                     int v__i = execsql->row->varnos[i];
                     varnosFor[i+fors->row->nfields] = v__i;
                 }
@@ -412,7 +557,7 @@ void handleFors(PLpgSQL_stmt_fors* fors ,List* parents, PLpgSQL_execstate *estat
                 /**
                  * Now the new FORS loop is correctly assembled and can replace the input FORS loop and the single-row assignment-EXECSQL statement.
                  */
-                replaceStmt(fors,newFors,parents);
+                replaceStmt((PLpgSQL_stmt*)fors,(PLpgSQL_stmt*)newFors,parents);
 
 
 
@@ -440,18 +585,7 @@ void analyse(PLpgSQL_execstate *estate, PLpgSQL_function *func){
 
             switch (stmt->cmd_type) {
                 case PLPGSQL_STMT_FORS:{
-                    handleFors(stmt,statements,estate,func);
-/*
-                    PLpgSQL_stmt_fors* fors = stmt;
-
-
-                    PLpgSQL_stmt* firstStmt = lfirst(fors->body->head);
-                    PLpgSQL_stmt_execsql* execsql = firstStmt;
-
-                    SelectStmt* select  = ((SelectStmt*)lfirst(raw_parser(execsql->sqlstmt->query)->head));
-
-                    printf("%i\n",fors->query->ns->itemno);
-*/
+                    handleFors((PLpgSQL_stmt_fors*)stmt,statements,estate,func);
 
                     break;
                 }
@@ -468,5 +602,12 @@ void analyse(PLpgSQL_execstate *estate, PLpgSQL_function *func){
         /* perform depenence analysis operations on igraph */
         //addProgramDependenceEdges(igraph);
 
+
+        /* re-add function datums. */
+        pfree(func->datums);
+        func->ndatums = plpgsql_nDatums;
+        func->datums = palloc(sizeof(PLpgSQL_datum *) * plpgsql_nDatums);
+        for (int i = 0; i < plpgsql_nDatums; i++)
+            func->datums[i] = plpgsql_Datums[i];
     }
 }
