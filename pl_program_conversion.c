@@ -601,6 +601,7 @@ PLpgSQL_rec* createRecordAndAddToNamespace(char* label){
  * @param estate  current state
  * @param func    function
  */
+// TODO: CREATE labels dynamically
 void handleFors(PLpgSQL_stmt_fors *fors ,
                 List               *parents,
                 PLpgSQL_execstate  *estate,
@@ -651,6 +652,9 @@ void handleFors(PLpgSQL_stmt_fors *fors ,
                                                 func,
                                                 1);
             }
+            /* nummber of columns referenced by the input fors query */
+            int n = c_new->length;
+
             sprintf(qbquery, "%s", projectWithAlias(qO->query,
                                                     concatValues( c_new,
                                                             ","), "_qO"));
@@ -678,55 +682,77 @@ void handleFors(PLpgSQL_stmt_fors *fors ,
                         qO->query,
                         qbquery,
                         c_new,
-                        "__c",//Problems with outer scope
+                        "__c",//TODO: fix problems with outer scope. 
                         "__c__"));
             PLpgSQL_rec* rec = fors->rec;
             List* body       = NIL;
+            /* Rule 1a-1 or 1a-3 (Rows-FORS statement) */
             if(fors->row){
-                // TODO: CREATE rec. , auslagern in function
+                /* create a record because we do not have one */
                 rec = createRecordAndAddToNamespace("__rec");
 
-
-
-                /* Woraround to get a record. This must be created in the future */
-                /* resolve the query refs */
+                /* resolve the column refs of the new FORS-LOOP */
                 List *cRes = resolveQueryRefs(qbquery);
-                for (int i = 0; i < m; i++) {
+                /* iterate the FORS input columns and create assignment statements for the input FORS statment columns */
+                for (int i = 0; i < n; i++) {
                     char* newQuery                     = palloc0(64);
+                    /* query to retrieve the current fors input column from the record */
                     sprintf(newQuery,"SELECT %s.%s",rec->refname, valToString(list_nth(cRes,i)));
+                    /* Create a corresponding recordfield that will be referenced by the assignment */
+                    //TODO: put in function
                     PLpgSQL_recfield* recfield         = palloc(sizeof(PLpgSQL_recfield));
                     recfield->dtype                    = PLPGSQL_DTYPE_RECFIELD;
                     recfield->fieldname                = valToString(list_nth(cRes,i));
                     recfield->recparentno              = rec->dno;
                     plpgsql_adddatum((PLpgSQL_datum *)recfield);
+                    /* Create asssignment that puts the record column in the correct plpgsql variable vi */
                     PLpgSQL_stmt_assign *newAssignment = createQueryAssignment( fors->row->varnos[i],
                                                                                 newQuery);
+                    /* use namespace of the execsql query */
                     newAssignment->expr->ns            = execsql->sqlstmt->ns;
+                    /* append it to the body of the new FORS-loop */
                     body                               = lappend(body,newAssignment);
                 }
             }
-            List *cRes = resolveQueryRefsSkipN(qbquery,m);
+            /* resolve the column refs of the new FORS-LOOP, skip n elements to get the m columns referenced by the input execsql statement */
+            List *cRes = resolveQueryRefsSkipN(qbquery,n);
             for (int i = 0; i < cRes->length; i++) {
                 char* newQuery             = palloc0(64);
+                /* query to retrieve the current execsql input column from the record */
                 sprintf(newQuery,"SELECT %s.%s",rec->refname, valToString(list_nth(cRes,i)));
+                /* Create a corresponding recordfield that will be referenced by the assignment */
+                //TODO: put in function
                 PLpgSQL_recfield* recfield = palloc(sizeof(PLpgSQL_recfield));
                 recfield->dtype            = PLPGSQL_DTYPE_RECFIELD;
                 recfield->fieldname        = valToString(list_nth(cRes,i));
                 recfield->recparentno      = rec->dno;
                 plpgsql_adddatum((PLpgSQL_datum *)recfield);
+                /* If we have row-variables in the execsql statement create a asssignment that puts the record column in the correct plpgsql variable v''i */
                 if(execsql->row){
                     PLpgSQL_stmt_assign *newAssignment = createQueryAssignment( execsql->row->varnos[i],
                                                                                 newQuery);
+                    /* use namespace of the execsql query */
                     newAssignment->expr->ns            = execsql->sqlstmt->ns;
+                    /* append it to the body of the new FORS-loop */
                     body                               = lappend(body,newAssignment);
                 }
             }
+            /* If we have  a record-variable in the execsql statement create a asssignment that copys the new record to this one */
             if(execsql->rec){
-                PLpgSQL_stmt_assign *newAssignment = createQueryAssignment(execsql->rec->dno, "SELECT r");
+                char* newQuery             = palloc0(64);
+                /* select the new record */
+                sprintf(newQuery,"SELECT %s",rec->refname);
+                /* assign the new record to the execsql recoord */
+                PLpgSQL_stmt_assign *newAssignment = createQueryAssignment(execsql->rec->dno, newQuery);
+                /* use namespace of the execsql query */
                 newAssignment->expr->ns            = execsql->sqlstmt->ns;
+                /* append it to the body of the new FORS-loop */
                 body                               = lappend(body,newAssignment);
             }
+            /* copy the following body of the input FORS-loop */
             body                       = list_concat(body,list_copy_tail(fors->body, 1));
+
+            /* assemble the new FORS-loop */
             PLpgSQL_stmt_fors *newFors = createFors(qbquery,
                                                     rec,
                                                     NULL,
@@ -736,6 +762,7 @@ void handleFors(PLpgSQL_stmt_fors *fors ,
              * Now the new FORS loop is correctly assembled and can replace the input FORS loop and the single-row assignment-EXECSQL statement.
              */
             replaceStmt((PLpgSQL_stmt *)fors, (PLpgSQL_stmt *)newFors, parents);
+            /* Switch back to the tmp cxt */
             MemoryContextSwitchTo(compile_tmp_cxt);
         }
     }
