@@ -22,5 +22,5 @@
  * Functions in pl_program_conversion.c
  * ----------
  */
-void analyse(PLpgSQL_execstate *estate, PLpgSQL_function *func);
+void analyse(PLpgSQL_execstate *estate, PLpgSQL_function *func, MemoryContext cxt) ;
 
