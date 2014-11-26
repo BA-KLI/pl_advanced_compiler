@@ -3,7 +3,6 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <igraph/igraph.h>
 
 
 #define MAXDOTFILESIZE 4096
